@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import { FHE, euint32, ebool } from "@fhevm/solidity/lib/FHE.sol";
+import { SepoliaConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
+
+contract PsiThreshold_FHE is SepoliaConfig {
+    struct Participant {
+        address addr;
+        euint32[] encryptedSet;
+        bool hasSubmitted;
+    }
+
+    struct ThresholdResult {
+        ebool isAboveThreshold;
+        bool isRevealed;
+        bool result;
+    }
+
+    uint256 public participantCount;
+    uint256 public setSize;
+    euint32 public encryptedThreshold;
+    bool public thresholdInitialized;
+
+    mapping(uint256 => Participant) public participants;
+    mapping(uint256 => ThresholdResult) public thresholdResults;
+    mapping(uint256 => uint256) private requestToParticipantId;
+
+    event ParticipantAdded(uint256 indexed participantId, address participant);
+    event SetSubmitted(uint256 indexed participantId);
+    event ThresholdSet();
+    event IntersectionRequested(uint256 indexed participantId);
+    event ResultRevealed(uint256 indexed participantId, bool result);
+
+    modifier onlyParticipant(uint256 participantId) {
+        require(msg.sender == participants[participantId].addr, "Not participant");
+        _;
+    }
+
+    modifier thresholdSet() {
+        require(thresholdInitialized, "Threshold not set");
+        _;
+    }
+
+    function addParticipant(address participantAddress, uint256 _setSize) public {
+        participantCount += 1;
+        participants[participantCount] = Participant({
+            addr: participantAddress,
+            encryptedSet: new euint32[](_setSize),
+            hasSubmitted: false
+        });
+        setSize = _setSize;
+        emit ParticipantAdded(participantCount, participantAddress);
+    }
+
+    function setEncryptedThreshold(euint32 _encryptedThreshold) public {
+        encryptedThreshold = _encryptedThreshold;
+        thresholdInitialized = true;
+        emit ThresholdSet();
+    }
+
+    function submitEncryptedSet(uint256 participantId, euint32[] memory _encryptedSet) public onlyParticipant(participantId) {
+        require(_encryptedSet.length == setSize, "Invalid set size");
+        require(!participants[participantId].hasSubmitted, "Already submitted");
+
+        for (uint i = 0; i < setSize; i++) {
+            participants[participantId].encryptedSet[i] = _encryptedSet[i];
+        }
+        participants[participantId].hasSubmitted = true;
+
+        thresholdResults[participantId] = ThresholdResult({
+            isAboveThreshold: FHE.asEbool(false),
+            isRevealed: false,
+            result: false
+        });
+
+        emit SetSubmitted(participantId);
+    }
+
+    function requestIntersection(uint256 participantId) public onlyParticipant(participantId) thresholdSet {
+        require(participants[participantId].hasSubmitted, "Set not submitted");
+        require(!thresholdResults[participantId].isRevealed, "Already revealed");
+
+        bytes32[] memory ciphertexts = new bytes32[](setSize + 1);
+        for (uint i = 0; i < setSize; i++) {
+            ciphertexts[i] = FHE.toBytes32(participants[participantId].encryptedSet[i]);
+        }
+        ciphertexts[setSize] = FHE.toBytes32(encryptedThreshold);
+
+        uint256 reqId = FHE.requestDecryption(ciphertexts, this.calculateIntersection.selector);
+        requestToParticipantId[reqId] = participantId;
+
+        emit IntersectionRequested(participantId);
+    }
+
+    function calculateIntersection(
+        uint256 requestId,
+        bytes memory cleartexts,
+        bytes memory proof
+    ) public {
+        uint256 participantId = requestToParticipantId[requestId];
+        require(participantId != 0, "Invalid request");
+
+        ThresholdResult storage result = thresholdResults[participantId];
+        require(!result.isRevealed, "Already revealed");
+
+        FHE.checkSignatures(requestId, cleartexts, proof);
+
+        (uint32[] memory setValues, uint32 threshold) = abi.decode(cleartexts, (uint32[], uint32));
+        uint32 intersectionCount = 0;
+
+        for (uint i = 0; i < setSize; i++) {
+            if (setValues[i] > 0) {
+                intersectionCount++;
+            }
+        }
+
+        result.result = intersectionCount >= threshold;
+        result.isRevealed = true;
+
+        emit ResultRevealed(participantId, result.result);
+    }
+
+    function getResult(uint256 participantId) public view returns (bool result, bool isRevealed) {
+        ThresholdResult storage r = thresholdResults[participantId];
+        return (r.result, r.isRevealed);
+    }
+
+    function verifyAllSubmitted() public view returns (bool) {
+        for (uint i = 1; i <= participantCount; i++) {
+            if (!participants[i].hasSubmitted) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
